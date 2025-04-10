@@ -171,7 +171,21 @@ def chat_with_mistral(prompt: str) -> str:
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail="Error from Hugging Face API")
             
-        return response.json()[0]["generated_text"].strip()
+        # Clean up the response to get only the actual message
+        full_response = response.json()[0]["generated_text"].strip()
+        
+        # Extract only the actual response part
+        if "### Response:" in full_response:
+            actual_response = full_response.split("### Response:")[-1].strip()
+        else:
+            actual_response = full_response
+            
+        # Remove any remaining instruction artifacts
+        actual_response = actual_response.replace("User:", "").strip()
+        actual_response = actual_response.split("### Instructions:")[0].strip()
+        
+        return actual_response
+        
     except Exception as e:
         logger.error(f"Mistral API error: {str(e)}")
         raise HTTPException(status_code=500, detail="Error generating AI response")
@@ -316,6 +330,8 @@ async def add_message(
     )
     
     ai_response = chat_with_mistral(f"{system_prompt}\n\nUser: {chat_data.message}")
+    # Remove any leading/trailing whitespace and newlines
+    ai_response = ai_response.strip()
     
     bot_message = Message(
         role="bot",
