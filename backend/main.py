@@ -13,9 +13,13 @@ import httpx
 import logging
 from cachetools import TTLCache
 from huggingface_hub import InferenceClient
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel
 import uuid
+
+from utils.memory_manager import MemoryManager
+from utils.sentiment_analyzer import SentimentAnalyzer
+from utils.prompt_builder import PromptBuilder
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,12 +45,34 @@ ALGORITHM = "HS256"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/google", auto_error=False)
 
 # MongoDB setup
+def get_database_client():
+    try:
+        # Direct connection string with retryWrites and proper timeout settings
+        connection_string = os.getenv("MONGO_URI")
+        if not connection_string:
+            raise ValueError("MONGO_URI environment variable is not set")
+            
+        client = motor.motor_asyncio.AsyncIOMotorClient(
+            connection_string,
+            serverSelectionTimeoutMS=5000,  # 5 second timeout
+            connectTimeoutMS=5000,
+            socketTimeoutMS=5000,
+            retryWrites=True,
+            retryReads=True,
+            maxPoolSize=50,
+            minPoolSize=10
+        )
+        return client
+    except Exception as e:
+        logger.error(f"MongoDB connection error: {e}")
+        raise
+
 try:
-    client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    db = client.userdb
+    client = get_database_client()
+    db = client.userdb  # Use your database name
     users_collection = db.users
 except Exception as e:
-    logger.error(f"MongoDB connection error: {e}")
+    logger.error(f"Failed to initialize MongoDB: {e}")
     raise
 
 # Cache setup
@@ -54,18 +80,23 @@ auth_cache = TTLCache(maxsize=100, ttl=300)
 
 # Hugging Face setup
 HF_TOKEN = os.getenv("HF_TOKEN")
-HUGGINGFACE_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.3"
-client = InferenceClient(model=HUGGINGFACE_REPO_ID, token=HF_TOKEN)
+HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+
+# Initialize new components
+memory_manager = MemoryManager()
+sentiment_analyzer = SentimentAnalyzer()
+prompt_builder = PromptBuilder()
 
 # Pydantic models
 class Message(BaseModel):
     role: str
     text: str
     timestamp: str
+    sentiment: Optional[Dict] = None
 
 class Chat(BaseModel):
     chat_id: str
-    chat_title: str  # New field
+    chat_title: str
     messages: List[Message]
     created_at: str
 
@@ -79,14 +110,16 @@ class User(BaseModel):
     name: str
     picture: str
     chats: List[Chat] = []
+    relationship_stage: str = "acquaintance"
+    personality_traits: List[str] = ["caring", "empathetic", "playful"]
 
 # System prompt
-SYSTEM_PROMPT = """You are an AI assistant.
-- Only respond to the latest user query.
-- Do NOT provide extra details unless asked explicitly.
-- Keep responses short and relevant.
-- If uncertain, say "I don't know."
-"""
+SYSTEM_PROMPT = """You are an AI companion with specific personality traits:
+- Be natural and engaging
+- Keep responses concise and meaningful
+- Respond based on the current relationship stage
+- Show emotional awareness
+- Be consistent in personality"""
 
 # Helper functions
 def create_access_token(data: dict):
@@ -116,26 +149,29 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         )
 
 def chat_with_mistral(prompt: str) -> str:
-    # Handle initial message differently
-    if "Hi! I'm the Mistral AI assistant" in prompt:
-        return "Hello! I'm ready to help you. Feel free to ask any questions or start a conversation."
-        
-    formatted_prompt = f"""### System Prompt:
-{SYSTEM_PROMPT}
-
-### User Input:
+    formatted_prompt = f"""### Instructions:
 {prompt}
 
-### AI Response:
-"""
+### Response:"""
+    
     try:
-        response = client.text_generation(
-            formatted_prompt,
-            max_new_tokens=150,  # Increased token limit
-            temperature=0.7,     # Slightly more creative
-            stop_sequences=["### User Input:", "### System Prompt:"]
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        response = httpx.post(
+            HUGGINGFACE_API_URL,
+            headers=headers,
+            json={"inputs": formatted_prompt, "parameters": {
+                "max_new_tokens": 150,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "presence_penalty": 0.6,
+                "frequency_penalty": 0.6
+            }}
         )
-        return response.strip()
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Error from Hugging Face API")
+            
+        return response.json()[0]["generated_text"].strip()
     except Exception as e:
         logger.error(f"Mistral API error: {str(e)}")
         raise HTTPException(status_code=500, detail="Error generating AI response")
@@ -149,7 +185,6 @@ async def login_url():
 
 @app.get("/oauth2callback")
 async def auth_callback(code: str, redirect_uri: str = None):
-    # Check cache
     cached_response = auth_cache.get(code)
     if cached_response:
         return cached_response
@@ -158,7 +193,6 @@ async def auth_callback(code: str, redirect_uri: str = None):
         from urllib.parse import unquote
         final_redirect_uri = unquote(redirect_uri) if redirect_uri else os.getenv("REDIRECT_URI")
         
-        # Exchange code for token
         token_url = "https://oauth2.googleapis.com/token"
         token_data = {
             "code": code,
@@ -189,7 +223,6 @@ async def auth_callback(code: str, redirect_uri: str = None):
             if 'id_token' not in response_data:
                 raise HTTPException(status_code=400, detail="Invalid OAuth response")
 
-            # Verify token
             user_info = id_token.verify_oauth2_token(
                 response_data["id_token"],
                 requests.Request(),
@@ -197,20 +230,18 @@ async def auth_callback(code: str, redirect_uri: str = None):
             )
 
             user_data = {
-                "user_id": user_info["sub"],  # Add Google OAuth sub as user_id
+                "user_id": user_info["sub"],
                 "email": user_info["email"],
                 "name": user_info.get("name", ""),
                 "picture": user_info.get("picture", "")
             }
 
-            # Update user in DB
             await users_collection.update_one(
-                {"user_id": user_data["user_id"]},  # Change to user_id
+                {"user_id": user_data["user_id"]},
                 {"$set": user_data},
                 upsert=True
             )
 
-            # Create JWT
             access_token = create_access_token(data={"sub": user_data["email"]})
             
             response_payload = {
@@ -230,19 +261,16 @@ async def auth_callback(code: str, redirect_uri: str = None):
 @app.post("/api/chat/new")
 async def create_new_chat(chat_data: ChatCreate, current_user: str = Depends(get_current_user)):
     try:
-        # Generate chat ID and timestamp
         chat_id = str(uuid.uuid4())
         timestamp = datetime.utcnow().isoformat()
         
-        # Create new chat object without initial messages
         new_chat = {
             "chat_id": chat_id,
             "chat_title": chat_data.chat_title,
-            "messages": [],  # Start with empty messages array
+            "messages": [],
             "created_at": timestamp
         }
         
-        # Save to database
         result = await users_collection.update_one(
             {"email": current_user},
             {"$push": {"chats": new_chat}},
@@ -259,16 +287,36 @@ async def create_new_chat(chat_data: ChatCreate, current_user: str = Depends(get
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/chat/{chat_id}/message")
-async def add_message(chat_id: str, chat_data: ChatCreate, current_user: str = Depends(get_current_user)):
+async def add_message(
+    chat_id: str,
+    chat_data: ChatCreate,
+    current_user: str = Depends(get_current_user)
+):
     timestamp = datetime.utcnow().isoformat()
     
+    user = await users_collection.find_one({"email": current_user})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    sentiment = await sentiment_analyzer.analyze(chat_data.message)
+    memories = await memory_manager.get_relevant_memories(user["user_id"], chat_data.message)
+    
+    system_prompt = prompt_builder.build_prompt(
+        relationship_stage=user.get("relationship_stage", "acquaintance"),
+        memories=memories,
+        sentiment=sentiment,
+        personality_traits=user.get("personality_traits", ["caring", "empathetic"])
+    )
+
     user_message = Message(
         role="user",
         text=chat_data.message,
-        timestamp=timestamp
+        timestamp=timestamp,
+        sentiment=sentiment
     )
     
-    ai_response = chat_with_mistral(chat_data.message)
+    ai_response = chat_with_mistral(f"{system_prompt}\n\nUser: {chat_data.message}")
+    
     bot_message = Message(
         role="bot",
         text=ai_response,
@@ -298,3 +346,75 @@ async def delete_chat(chat_id: str, current_user: str = Depends(get_current_user
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Chat not found")
     return {"status": "success"}
+
+@app.post("/api/analyze-sentiment")
+async def analyze_sentiment(
+    message: str,
+    current_user: str = Depends(get_current_user)
+):
+    sentiment = sentiment_analyzer.analyze(message)
+    return sentiment
+
+@app.post("/api/store-memory")
+async def store_memory(
+    memory: str,
+    current_user: str = Depends(get_current_user)
+):
+    try:
+        # Get user info to use user_id instead of email
+        user = await users_collection.find_one({"email": current_user})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        memory_manager.add_memory(user["user_id"], memory)
+        return {"status": "success", "message": "Memory stored successfully"}
+    except Exception as e:
+        logger.error(f"Error storing memory: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to store memory")
+
+@app.get("/api/memories")
+async def get_memories(query: str, current_user: str = Depends(get_current_user)):
+    try:
+        user = await users_collection.find_one({"email": current_user})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        memories = await memory_manager.get_relevant_memories(user["user_id"], query)
+        return {"memories": memories or []}  # Ensure we always return a list
+    except Exception as e:
+        logger.error(f"Error retrieving memories: {str(e)}")
+        return {"memories": []}  # Return empty list on error
+
+@app.post("/api/update-relationship")
+async def update_relationship(
+    request: Request,
+    current_user: str = Depends(get_current_user)
+):
+    try:
+        body = await request.json()
+        stage = body.get("stage")
+        if not stage or stage not in prompt_builder.RELATIONSHIP_STAGES:
+            raise HTTPException(status_code=400, detail="Invalid relationship stage")
+            
+        result = await users_collection.update_one(
+            {"email": current_user},
+            {"$set": {"relationship_stage": stage}}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        return {"status": "success", "stage": stage}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+
+# Add health check endpoint
+@app.get("/health")
+async def health_check():
+    try:
+        # Ping MongoDB
+        await client.admin.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Database connection failed")

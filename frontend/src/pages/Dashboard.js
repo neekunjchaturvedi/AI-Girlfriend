@@ -4,6 +4,7 @@ import { useChat } from "../context/ChatContext";
 import { useNavigate } from "react-router-dom";
 import ChatList from "../components/ChatList";
 import ChatInterface from "../components/ChatInterface";
+import RelationshipStage from "../components/RelationshipStage";
 
 const Dashboard = () => {
   const { user, logout } = useAuth();
@@ -54,7 +55,10 @@ const Dashboard = () => {
       </div>
 
       <div className="h-[calc(100vh-4rem)] flex">
-        <ChatList />
+        <div className="w-64 flex flex-col">
+          <RelationshipStage />
+          <ChatList />
+        </div>
         <div className="flex-1">
           <ChatInterface />
         </div>

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useChat } from '../context/ChatContext';
+import MemoryPanel from './MemoryPanel';
 
 const ChatInterface = () => {
   const [message, setMessage] = useState('');
@@ -26,6 +27,26 @@ const ChatInterface = () => {
     }
   };
 
+  const renderMessage = (msg, index) => (
+    <div key={index} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+      <div
+        className={`max-w-[70%] p-3 rounded-lg ${
+          msg.role === 'user'
+            ? 'bg-blue-600 text-white'
+            : 'bg-gray-200 text-gray-800'
+        }`}
+      >
+        {msg.text}
+      </div>
+      {msg.sentiment && (
+        <span className="text-xs text-gray-500 mt-1">
+          Mood: {msg.sentiment.dominant} ({Math.round(msg.sentiment.confidence * 100)}%)
+        </span>
+      )}
+      {msg.role === 'user' && <MemoryPanel message={msg.text} />}
+    </div>
+  );
+
   if (!currentChat) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-gray-500 p-8">
@@ -48,22 +69,7 @@ const ChatInterface = () => {
   return (
     <div className="h-full flex flex-col">
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {currentChat.messages.map((msg, index) => (
-          <div
-            key={index}
-            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-          >
-            <div
-              className={`max-w-[70%] p-3 rounded-lg ${
-                msg.role === 'user'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-200 text-gray-800'
-              }`}
-            >
-              {msg.text}
-            </div>
-          </div>
-        ))}
+        {currentChat.messages.map((msg, index) => renderMessage(msg, index))}
         <div ref={messagesEndRef} />
       </div>
       
